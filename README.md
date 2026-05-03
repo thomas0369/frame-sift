@@ -9,6 +9,19 @@ Extrahiert alle einzigartigen Frames (Slideshow-artige Standbilder) aus einem Yo
 3. Dedupliziert visuell identische/ähnliche Frames per Perceptual Hashing (pHash)
 4. Erzeugt einen strukturierten Analyse-Prompt für Claude Code
 
+## Architektur
+
+```mermaid
+flowchart LR
+    YT(["YouTube-URL"]) --> EX["src.extract<br/>Download → Frames → Dedup"]
+    EX --> MF["manifest.json<br/>+ frames_unique/"]
+    MF --> AN["src.analyze<br/>Prompt-Generator"]
+    AN --> CC["Claude Code<br/>Vision-Analyse"]
+    CC --> OUT["analysis.json<br/>analysis.md"]
+```
+
+Detaillierte Diagramme (Pipeline, pHash-Algorithmus, Datenmodell, Cache-Verhalten): [docs/architecture.md](docs/architecture.md)
+
 ## Voraussetzungen
 
 - Python 3.11+

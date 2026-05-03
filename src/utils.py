@@ -7,16 +7,18 @@ from pathlib import Path
 
 
 OUTPUT_DIR = Path("output")
-LOG_FILE = OUTPUT_DIR / "run.log"
 
 
-def setup_logging() -> logging.Logger:
-    """Richtet strukturiertes Logging nach stdout und output/run.log ein.
+def setup_logging(log_dir: Path = OUTPUT_DIR) -> logging.Logger:
+    """Richtet strukturiertes Logging nach stdout und <log_dir>/run.log ein.
+
+    Args:
+        log_dir: Verzeichnis, in das run.log geschrieben wird.
 
     Returns:
         Konfigurierter Logger für das Paket.
     """
-    OUTPUT_DIR.mkdir(exist_ok=True)
+    log_dir.mkdir(parents=True, exist_ok=True)
 
     fmt = "%(asctime)s %(levelname)-8s %(message)s"
     datefmt = "%H:%M:%S"
@@ -29,7 +31,7 @@ def setup_logging() -> logging.Logger:
         console.setLevel(logging.INFO)
         console.setFormatter(logging.Formatter(fmt, datefmt=datefmt))
 
-        file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+        file_handler = logging.FileHandler(log_dir / "run.log", encoding="utf-8")
         file_handler.setLevel(logging.DEBUG)
         file_handler.setFormatter(logging.Formatter(fmt, datefmt=datefmt))
 

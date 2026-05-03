@@ -10,56 +10,37 @@ from pathlib import Path
 from src.utils import OUTPUT_DIR, setup_logging
 
 
-FRAMES_UNIQUE_DIR = OUTPUT_DIR / "frames_unique"
-MANIFEST_FILE = OUTPUT_DIR / "manifest.json"
-ANALYSIS_PROMPT_FILE = OUTPUT_DIR / "ANALYSIS_PROMPT.md"
+def _load_manifest(manifest_file: Path) -> dict[str, str]:
+    """Liest das Manifest und gibt ein Dict {filename → timestamp} zurück.
 
-PROMPT_HEADER = """\
-# Frame-Analyse-Auftrag
-
-Analysiere die Bilder in `output/frames_unique/`. Pro Bild liefere als JSON-Eintrag:
-
-- `filename`
-- `timestamp` (aus manifest.json)
-- `texts` (alle wörtlich erkennbaren Texte als Liste)
-- `symbols` (Symbole, Logos, Icons)
-- `numbers` (alle sichtbaren Zahlen)
-- `people` (erkennbare Personen)
-- `places` (erkennbare Orte)
-- `notable` (Auffälligkeiten)
-
-Schreibe Ergebnis als JSON-Array nach `output/analysis.json` UND als Markdown-Tabelle \
-nach `output/analysis.md`. Append-Modus zwischen Batches, nicht überschreiben.
-
-"""
-
-
-def _load_manifest() -> dict[str, str]:
-    """Liest das Manifest und gibt ein Dict {filename → timestamp} zurück."""
-    if not MANIFEST_FILE.exists():
+    Unterstützt sowohl das alte Format (JSON-Array) als auch das neue Format
+    (JSON-Objekt mit "meta" und "frames"-Schlüsseln).
+    """
+    if not manifest_file.exists():
         return {}
-    entries = json.loads(MANIFEST_FILE.read_text(encoding="utf-8"))
+    data = json.loads(manifest_file.read_text(encoding="utf-8"))
+    entries = data["frames"] if isinstance(data, dict) else data
     return {e["filename"]: e["timestamp_video"] for e in entries}
 
 
-def _get_frame_paths() -> list[Path]:
+def _get_frame_paths(frames_unique_dir: Path) -> list[Path]:
     """Gibt alle unique Frames sortiert zurück.
 
     Raises:
         SystemExit: Wenn das Unique-Frames-Verzeichnis leer oder nicht vorhanden ist.
     """
-    if not FRAMES_UNIQUE_DIR.exists():
+    if not frames_unique_dir.exists():
         print(
-            f"Fehler: {FRAMES_UNIQUE_DIR} existiert nicht. "
-            "Bitte zuerst 'python -m src.extract' ausführen.",
+            f"Fehler: {frames_unique_dir} existiert nicht. "
+            "Bitte zuerst 'python -m src.extract <URL>' ausführen.",
             file=sys.stderr,
         )
         sys.exit(1)
 
-    frames = sorted(FRAMES_UNIQUE_DIR.glob("frame_*.jpg"))
+    frames = sorted(frames_unique_dir.glob("frame_*.jpg"))
     if not frames:
         print(
-            f"Fehler: Keine Frames in {FRAMES_UNIQUE_DIR} gefunden.",
+            f"Fehler: Keine Frames in {frames_unique_dir} gefunden.",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -86,17 +67,45 @@ def mode_list(frames: list[Path], batch_size: int) -> None:
     print(f"\nGesamt: {len(frames)} Frames in {len(batches)} Batches")
 
 
-def mode_prompt(frames: list[Path], batch_size: int) -> None:
-    """Generiert output/ANALYSIS_PROMPT.md mit Batch-Listen.
+def mode_prompt(
+    frames: list[Path],
+    batch_size: int,
+    manifest_file: Path,
+    analysis_prompt_file: Path,
+    project_dir: Path,
+) -> None:
+    """Generiert ANALYSIS_PROMPT.md im Projektverzeichnis mit Batch-Listen.
 
     Args:
         frames: Alle unique Frame-Pfade.
         batch_size: Anzahl Frames pro Batch.
+        manifest_file: Pfad zur manifest.json.
+        analysis_prompt_file: Ausgabepfad für den Prompt.
+        project_dir: Projektverzeichnis (für den Prompt-Header).
     """
-    timestamps = _load_manifest()
+    prompt_header = f"""\
+# Frame-Analyse-Auftrag
+
+Analysiere die Bilder in `{project_dir}/frames_unique/`. Pro Bild liefere als JSON-Eintrag:
+
+- `filename`
+- `timestamp` (aus manifest.json)
+- `texts` (alle wörtlich erkennbaren Texte als Liste)
+- `symbols` (Symbole, Logos, Icons)
+- `numbers` (alle sichtbaren Zahlen)
+- `people` (erkennbare Personen)
+- `places` (erkennbare Orte)
+- `notable` (Auffälligkeiten)
+
+Schreibe Ergebnis als JSON-Array nach `{project_dir}/analysis.json` UND als Markdown-Tabelle \
+nach `{project_dir}/analysis.md`. Append-Modus zwischen Batches, nicht überschreiben.
+
+"""
+
+    timestamps = _load_manifest(manifest_file)
     batches = _build_batches(frames, batch_size)
 
-    lines: list[str] = [PROMPT_HEADER]
+    lines: list[str] = [prompt_header]
     for batch_num, batch in enumerate(batches, start=1):
         lines.append(f"## Batch {batch_num}\n")
         for path in batch:
@@ -105,24 +114,24 @@ def mode_prompt(frames: list[Path], batch_size: int) -> None:
             lines.append(f"- {path}{comment}")
         lines.append("")
 
-    ANALYSIS_PROMPT_FILE.write_text("\n".join(lines), encoding="utf-8")
+    analysis_prompt_file.write_text("\n".join(lines), encoding="utf-8")
     log.info(
         "Prompt geschrieben: %s (%d Frames, %d Batches)",
-        ANALYSIS_PROMPT_FILE,
+        analysis_prompt_file,
         len(frames),
         len(batches),
     )
-    print(f"Prompt gespeichert: {ANALYSIS_PROMPT_FILE}")
+    print(f"Prompt gespeichert: {analysis_prompt_file}")
 
 
 def main() -> None:
     """Einstiegspunkt für den Prompt-Generator."""
     global log
-    log = setup_logging()
 
     parser = argparse.ArgumentParser(
         description="Generiert Frame-Listen und Analyse-Prompts für Claude Code."
     )
+    parser.add_argument("video_id", help="YouTube Video-ID (z.B. H0zKcbL89dU)")
     parser.add_argument(
         "--mode",
         choices=["list", "prompt"],
@@ -137,16 +146,23 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    frames = _get_frame_paths()
-    log.info("Gefunden: %d unique Frames", len(frames))
+    project_dir = OUTPUT_DIR / args.video_id
+    frames_unique_dir = project_dir / "frames_unique"
+    manifest_file = project_dir / "manifest.json"
+    analysis_prompt_file = project_dir / "ANALYSIS_PROMPT.md"
+
+    log = setup_logging(log_dir=project_dir)
+
+    frames = _get_frame_paths(frames_unique_dir)
+    log.info("Gefunden: %d unique Frames in %s", len(frames), project_dir)
 
     if args.mode == "list":
         mode_list(frames, args.batch_size)
     else:
-        mode_prompt(frames, args.batch_size)
+        mode_prompt(frames, args.batch_size, manifest_file, analysis_prompt_file, project_dir)
 
 
-log: logging.Logger
+log: logging.Logger = logging.getLogger("frame_sift")
 
 if __name__ == "__main__":
     main()

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import shutil
 import subprocess
 import tempfile
 import time
@@ -37,6 +38,19 @@ def _extract_video_id(url: str) -> str:
     if parts:
         return parts[-1]
     raise ValueError(f"Keine Video-ID in URL gefunden: {url}")
+
+
+def _is_channel_url(url: str) -> bool:
+    """Prüft, ob es eine Kanal-URL ist (@ChannelName, /c/Name, /user/Name)."""
+    parsed = urlparse(url)
+    path = parsed.path.lower()
+    return (
+        "/@" in parsed.path or  # @ChannelName
+        "/c/" in path or  # /c/ChannelName
+        "/user/" in path or  # /user/ChannelName
+        "/channel/" in path or  # /channel/UC...
+        path.endswith("/videos")  # .../videos
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -98,6 +112,46 @@ def _compute_frame_hashes(
 # ---------------------------------------------------------------------------
 # Phase A: Video-Typ-Erkennung + Adaptive FPS
 # ---------------------------------------------------------------------------
+
+def _extract_video_ids_from_channel(channel_url: str, max_videos: int = 2) -> list[tuple[str, str]]:
+    """Extrahiert Video-IDs und Titel aus einer Kanal-URL.
+
+    Returns:
+        Liste von (video_id, title) Tupeln.
+    """
+    log.info("Extrahiere Video-IDs aus Kanal...")
+    result = subprocess.run(
+        [
+            "yt-dlp",
+            "--flat-playlist",
+            "--get-id",
+            "--get-title",
+            "--playlist-end",
+            str(max_videos),
+            "--no-playlist-meta",
+            "--no-playlist-thumbnails",
+            channel_url,
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    video_data = []
+    for line in result.stdout.strip().split("\n"):
+        if not line.strip():
+            continue
+        if line.startswith("[download]"):
+            continue
+        parts = line.split(" ", 1)
+        if len(parts) == 2:
+            video_id = parts[0].strip()
+            title = parts[1].strip()
+            video_data.append((video_id, title))
+
+    log.info("%d Video(s) gefunden", len(video_data))
+    return video_data
+
 
 def _presample_for_type(
     video_file: Path,
@@ -396,7 +450,8 @@ def _run_dedup_global(
 
 def _download_video(url: str, project_dir: Path, max_height: int, force: bool) -> None:
     """Lädt das Video mit yt-dlp herunter."""
-    video_file = project_dir / "video.mp4"
+    video_id = _extract_video_id(url)
+    video_file = project_dir / f"{video_id}.mp4"
     if video_file.exists() and not force:
         log.info("Video bereits vorhanden, überspringe Download: %s", video_file)
         return
@@ -404,20 +459,28 @@ def _download_video(url: str, project_dir: Path, max_height: int, force: bool) -
     project_dir.mkdir(parents=True, exist_ok=True)
     log.info("Lade Video herunter: %s", url)
 
-    subprocess.run(
-        [
-            "yt-dlp",
-            "--format",
-            f"bestvideo[height<={max_height}]+bestaudio/best",
-            "--merge-output-format",
-            "mp4",
-            "--output",
-            str(video_file),
-            "--no-playlist",
-            url,
-        ],
-        check=True,
-    )
+    # Node.js-Pfad für yt-dlp konfigurieren
+    node_path = shutil.which("node")
+    yt_dlp_args = [
+        "yt-dlp",
+        "--format",
+        f"bestvideo[height<={max_height}]+bestaudio/best",
+        "--merge-output-format",
+        "mp4",
+        "--output",
+        str(video_file),
+    ]
+
+    # Node.js explizit angeben wenn gefunden
+    if node_path:
+        yt_dlp_args.extend(["--js-runtimes", f"node:{node_path}"])
+        log.debug(f"Verwende Node.js: {node_path}")
+    else:
+        log.warning("Node.js nicht gefunden - JavaScript-Features könnten fehlen")
+
+    yt_dlp_args.extend(["--no-playlist", url])
+
+    subprocess.run(yt_dlp_args, check=True)
     log.info("Download abgeschlossen: %s", video_file)
 
 
@@ -437,7 +500,8 @@ def _read_fps_from_manifest(project_dir: Path) -> float | None:
 def _extract_frames(project_dir: Path, fps: float, force: bool) -> int:
     """Extrahiert Frames aus dem Video mit ffmpeg."""
     frames_raw_dir = project_dir / "frames_raw"
-    video_file = project_dir / "video.mp4"
+    video_id = project_dir.name
+    video_file = project_dir / f"{video_id}.mp4"
 
     if frames_raw_dir.exists() and any(frames_raw_dir.iterdir()) and not force:
         existing = sorted(frames_raw_dir.glob("frame_*.jpg"))
@@ -601,72 +665,8 @@ def _write_manifest(
 # CLI
 # ---------------------------------------------------------------------------
 
-def main() -> None:
-    """Einstiegspunkt für die Frame-Extraktion."""
-    global log
-
-    parser = argparse.ArgumentParser(
-        description="Extrahiert einzigartige Frames aus einem YouTube-Video."
-    )
-    parser.add_argument("url", help="YouTube-URL")
-    parser.add_argument(
-        "--fps",
-        type=float,
-        default=None,
-        help="Frames pro Sekunde (Standard: automatisch — 1 fps für Slideshows, 2 fps sonst)",
-    )
-    parser.add_argument(
-        "--threshold",
-        type=int,
-        default=None,
-        help="pHash Hamming-Distanz-Schwellenwert (Standard: automatisch erkannt)",
-    )
-    parser.add_argument(
-        "--hash-size",
-        type=int,
-        default=16,
-        help="pHash-Gittergröße NxN (Standard: 16)",
-    )
-    parser.add_argument(
-        "--max-height",
-        type=int,
-        default=1080,
-        help="Maximale Video-Höhe in Pixeln (Standard: 1080)",
-    )
-    parser.add_argument(
-        "--dedup-mode",
-        choices=["sliding", "global"],
-        default="sliding",
-        help=(
-            "sliding: vergleicht jeden Frame nur mit dem unmittelbar vorherigen (Standard) | "
-            "global: vergleicht gegen alle bisher gehaltenen Frames"
-        ),
-    )
-    parser.add_argument(
-        "--no-second-pass",
-        action="store_true",
-        help="Zweiten globalen Dedup-Pass deaktivieren (nur bei --dedup-mode sliding relevant)",
-    )
-    parser.add_argument(
-        "--force",
-        action="store_true",
-        help="Existierende Daten überschreiben",
-    )
-    args = parser.parse_args()
-
-    video_id = _extract_video_id(args.url)
-    project_dir = OUTPUT_DIR / video_id
-    project_dir.mkdir(parents=True, exist_ok=True)
-
-    log = setup_logging(log_dir=project_dir)
-    log.info("Projekt-Verzeichnis: %s", project_dir)
-
-    validate_dependencies()
-
-    t_start = time.monotonic()
-
-    _download_video(args.url, project_dir, args.max_height, args.force)
-
+def _process_video(project_dir: Path, args: argparse.Namespace, t_start: float) -> None:
+    """Verarbeitet ein einzelnes Video vollstündig."""
     # FPS bestimmen: explizit → Manifest-Cache → Video-Typ-Erkennung
     frames_raw_dir = project_dir / "frames_raw"
     video_type: str | None = None
@@ -678,7 +678,8 @@ def main() -> None:
         log.info("FPS aus Manifest übernommen: %.1f", fps)
     else:
         log.info("Analysiere Video-Typ (Pre-Sample) ...")
-        sample_hashes = _presample_for_type(project_dir / "video.mp4")
+        video_id = project_dir.name
+        sample_hashes = _presample_for_type(project_dir / f"{video_id}.mp4")
         video_type = _detect_video_type(sample_hashes)
         fps = 1.0 if video_type == "slideshow" else 2.0
         log.info("Adaptive FPS: %.1f (Video-Typ: %s)", fps, video_type)
@@ -740,6 +741,116 @@ def main() -> None:
         " auto" if auto_threshold else "",
         fps,
     )
+
+
+def main() -> None:
+    """Einstiegspunkt für die Frame-Extraktion."""
+    global log
+
+    parser = argparse.ArgumentParser(
+        description="Extrahiert einzigartige Frames aus einem YouTube-Video."
+    )
+    parser.add_argument("url", help="YouTube-URL")
+    parser.add_argument(
+        "--fps",
+        type=float,
+        default=None,
+        help="Frames pro Sekunde (Standard: automatisch — 1 fps für Slideshows, 2 fps sonst)",
+    )
+    parser.add_argument(
+        "--threshold",
+        type=int,
+        default=None,
+        help="pHash Hamming-Distanz-Schwellenwert (Standard: automatisch erkannt)",
+    )
+    parser.add_argument(
+        "--hash-size",
+        type=int,
+        default=16,
+        help="pHash-Gittergröße NxN (Standard: 16)",
+    )
+    parser.add_argument(
+        "--max-height",
+        type=int,
+        default=1080,
+        help="Maximale Video-Höhe in Pixeln (Standard: 1080)",
+    )
+    parser.add_argument(
+        "--dedup-mode",
+        choices=["sliding", "global"],
+        default="sliding",
+        help=(
+            "sliding: vergleicht jeden Frame nur mit dem unmittelbar vorherigen (Standard) | "
+            "global: vergleicht gegen alle bisher gehaltenen Frames"
+        ),
+    )
+    parser.add_argument(
+        "--no-second-pass",
+        action="store_true",
+        help="Zweiten globalen Dedup-Pass deaktivieren (nur bei --dedup-mode sliding relevant)",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Existierende Daten überschreiben",
+    )
+    args = parser.parse_args()
+
+    # Prüfen, ob es eine Kanal-URL ist
+    if _is_channel_url(args.url):
+        log.info("Kanal-URL erkannt - lade alle Videos...")
+
+        # Video-IDs aus Kanal extrahieren
+        video_data = _extract_video_ids_from_channel(args.url, max_videos=29)
+
+        if not video_data:
+            log.error("Keine Videos aus Kanal gefunden")
+            sys.exit(1)
+
+        # Für jedes Video die Extraktion durchführen
+        for i, (video_id, title) in enumerate(video_data, start=1):
+            log.info("=" * 60)
+            log.info("Video %d/%d: %s (%s)", i, len(video_data), title, video_id)
+            log.info("=" * 60)
+
+            video_url = f"https://www.youtube.com/watch?v={video_id}"
+            project_dir = OUTPUT_DIR / video_id
+            project_dir.mkdir(parents=True, exist_ok=True)
+
+            log = setup_logging(log_dir=project_dir)
+            log.info("Projekt-Verzeichnis: %s", project_dir)
+
+            validate_dependencies()
+
+            t_start = time.monotonic()
+
+            try:
+                _download_video(video_url, project_dir, args.max_height, args.force)
+                _process_video(project_dir, args, t_start)
+            except Exception as exc:
+                log.error("Verarbeitung von Video %s fehlgeschlagen: %s", video_id, exc)
+                continue
+
+        log.info("=" * 60)
+        log.info("Alle Videos verarbeitet: %d von %d erfolgreich", len(video_data), len(video_data))
+        log.info("=" * 60)
+        return
+
+    # Einzelnes Video
+    video_id = _extract_video_id(args.url)
+    project_dir = OUTPUT_DIR / video_id
+    project_dir.mkdir(parents=True, exist_ok=True)
+
+    log = setup_logging(log_dir=project_dir)
+    log.info("Projekt-Verzeichnis: %s", project_dir)
+
+    validate_dependencies()
+
+    t_start = time.monotonic()
+
+    _download_video(args.url, project_dir, args.max_height, args.force)
+
+    _process_video(project_dir, args, t_start)
 
 
 log: logging.Logger = logging.getLogger("frame_sift")
